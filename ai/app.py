@@ -1,72 +1,86 @@
-import os
-import io
-import json
-import numpy as np
 from flask import Flask, request, jsonify
-from PIL import Image
-import easyocr
-from pydantic import BaseModel, Field, ValidationError
-from typing import List, Optional
 from flask_cors import CORS
+import easyocr
+import filetype
+import os
+import re
+import numpy as np
+from pdf2image import convert_from_path
+from PIL import Image
+import json
 
 app = Flask(__name__)
-CORS(app)  
+CORS(app)
 reader = easyocr.Reader(['en'])
 
+def extract_text_from_file(file):
+    text_output = ""
+    kind = filetype.guess(file.read(261))
+    file.seek(0)
 
-class DesiredItem(BaseModel):
-    name: str
-    quantity: Optional[str] = None
+    if kind and kind.mime.startswith("image"):
+        img = Image.open(file.stream).convert('RGB')
+        result = reader.readtext(np.array(img), detail=0)
+        text_output = " ".join(str(r) for r in result)
 
+    elif "pdf" in (kind.mime if kind else "") or file.filename.endswith(".pdf"):
+        temp_path = "temp_prescription.pdf"
+        with open(temp_path, 'wb') as f:
+            f.write(file.read())
 
-def ocr_image_with_easyocr(image_bytes: bytes) -> str:
-    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    image_np = np.array(image)
-    result = reader.readtext(image_np, detail=0)
-    return " ".join(result)
+        images = convert_from_path(temp_path, dpi=300)
+        for img in images:
+            img_np = np.array(img.convert('RGB'))
+            result = reader.readtext(img_np, detail=0)
+            text_output += " ".join(str(r) for r in result)
 
+        os.remove(temp_path)
+    else:
+        raise ValueError("Unsupported file type")
+
+    return text_output
 
 @app.route("/verify-prescription", methods=["POST"])
 def verify_prescription():
-    if 'prescription_image' not in request.files:
-        return jsonify({"error": "No image uploaded."}), 400
+    if 'file' not in request.files or 'desired_items' not in request.form:
+        return jsonify({"error": "Missing file or desired_items"}), 400
 
-    prescription_file = request.files['prescription_image']
-    if not prescription_file.filename.lower().endswith((".png", ".jpg", ".jpeg")):
-        return jsonify({"error": "Only PNG, JPG, JPEG image files are supported."}), 400
-
+    file = request.files['file']
     try:
-        image_bytes = prescription_file.read()
-        prescription_text = ocr_image_with_easyocr(image_bytes).lower()
+        desired_items = json.loads(request.form['desired_items'])
+        desired_names = [item["name"].lower() for item in desired_items]
 
-        desired_items_json = request.form.get("desired_items_json", "")
-        parsed_json_data = json.loads(desired_items_json)
-        desired_items_list = [DesiredItem(**item) for item in parsed_json_data]
+        ocr_text = extract_text_from_file(file)
+        lower_text = ocr_text.lower()
 
-        matched_items = []
-        unmatched_items = []
+        matched_items = [name for name in desired_names if name in lower_text]
+        unmatched_items = [item for item in desired_items if item["name"].lower() not in matched_items]
+        prescribed_items = [{"medication_name": name.title()} for name in matched_items]
 
-        for item in desired_items_list:
-            if item.name.lower() in prescription_text:
-                matched_items.append(item.name)
-            else:
-                unmatched_items.append(item.name)
+    
+        is_valid_order = len(matched_items) > 0
 
         response = {
-            "prescriptionRequired": len(unmatched_items) == 0,
-            "matched_items": matched_items,
-            "unmatched_desired_items": unmatched_items,
-            "prescription_text": prescription_text
+            "ocr_text": ocr_text,
+            "desired_items": desired_items,
+            "verification_result": {
+                "is_valid_order": is_valid_order,
+                "identified_prescribed_items": prescribed_items,
+                "verification_details": (
+                    "All medications found in prescription"
+                    if len(matched_items) == len(desired_names)
+                    else "Partial match found" if matched_items else "No matches found"
+                ),
+                "matched_items": [name.title() for name in matched_items],
+                "unmatched_desired_items": unmatched_items,
+                "additional_notes": (
+                    "All requested medications are valid"
+                    if not unmatched_items
+                    else "Some items missing"
+                )
+            },
+            "message": "Verification complete"
         }
-
         return jsonify(response)
-
-    except json.JSONDecodeError:
-        return jsonify({"error": "Invalid JSON format in desired_items_json."}), 400
-    except ValidationError as e:
-        return jsonify({"error": f"Validation failed: {e}"}), 400
     except Exception as e:
-        return jsonify({"error": f"Unexpected server error: {str(e)}"}), 500
-
-if __name__ == '__main__':
-    app.run(debug=True, port=6000)
+        return jsonify({"error": str(e)}), 500
