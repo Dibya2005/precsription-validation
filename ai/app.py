@@ -1,117 +1,119 @@
 from flask import Flask, request, jsonify
-from werkzeug.utils import secure_filename
+from flask_cors import CORS
+import easyocr
+import filetype
 import os
-import io
 import json
 import numpy as np
+from pdf2image import convert_from_path
 from PIL import Image
-import easyocr
-from pydantic import BaseModel, Field, ValidationError
-from typing import List, Optional
-from langchain_groq import ChatGroq
-from langchain_core.prompts import ChatPromptTemplate
 
 app = Flask(__name__)
+CORS(app)
 
-# Configuration
-app.config['UPLOAD_FOLDER'] = './uploads'
-app.config['ALLOWED_EXTENSIONS'] = {'png', 'jpg', 'jpeg', 'pdf'}
-os.environ["GROQ_API_KEY"] = "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"
-
-# Initialize EasyOCR
 reader = easyocr.Reader(['en'])
 
-# --- Pydantic Models ---
-class PrescriptionItem(BaseModel):
-    medication_name: str = Field(description="Name of the prescribed medication")
+# Load prescription requirement mapping
+with open('prescription_required.json') as f:
+    prescription_required_map = json.load(f)
 
-class DesiredItem(BaseModel):
-    name: str = Field(description="Name of the desired medication")
-    quantity: Optional[str] = Field(None, description="Desired quantity")
+# Helper function to extract text from a file (image or PDF)
+def extract_text_from_file(file):
+    text_output = ""
 
-class VerificationResult(BaseModel):
-    is_valid_order: bool
-    identified_prescribed_items: List[PrescriptionItem]
-    verification_details: str
-    matched_items: List[str]
-    unmatched_desired_items: List[str]
-    additional_notes: Optional[str] = None
+    kind = filetype.guess(file.read(261))
+    file.seek(0)
 
-# Initialize LLM
-llm = ChatGroq(model="llama3-8b-8192", temperature=0.0)
-llm_with_tool = llm.with_structured_output(VerificationResult)
+    if kind and kind.mime.startswith("image"):
+        img = Image.open(file.stream).convert('RGB')
+        result = reader.readtext(np.array(img), detail=0)
+        text_output = " ".join(str(r) for r in result)
 
-prompt = ChatPromptTemplate.from_messages([
-    ("system", """You are a medical prescription verification AI. Analyze the prescription text and compare it with desired medications."""),
-    ("human", "Prescription:\n{prescription_text}\n\nDesired Items:\n{desired_items_json}")
-])
+    elif (kind and "pdf" in kind.mime) or file.filename.lower().endswith(".pdf"):
+        temp_path = "temp_prescription.pdf"
+        with open(temp_path, 'wb') as f:
+            f.write(file.read())
 
-chain = prompt | llm_with_tool
+        images = convert_from_path(temp_path, dpi=300)
+        for img in images:
+            img_np = np.array(img.convert('RGB'))
+            result = reader.readtext(img_np, detail=0)
+            text_output += " " + " ".join(str(r) for r in result)
 
-def allowed_file(filename):
-    return '.' in filename and \
-           filename.rsplit('.', 1)[1].lower() in app.config['ALLOWED_EXTENSIONS']
+        os.remove(temp_path)
+    else:
+        raise ValueError("Unsupported file type")
 
-def ocr_image(image_bytes):
-    try:
-        image = Image.open(io.BytesIO(image_bytes))
-        image_np = np.array(image)
-        results = reader.readtext(image_np, detail=0)
-        return "\n".join(results)
-    except Exception as e:
-        raise Exception(f"OCR failed: {str(e)}")
+    return text_output.strip()
 
-@app.route('/verify-prescription', methods=['POST'])
+@app.route("/verify-prescription", methods=["POST"])
 def verify_prescription():
-    if 'prescription_image' not in request.files:
-        return jsonify({"error": "No image file provided"}), 400
-    
-    file = request.files['prescription_image']
-    desired_items_json = request.form.get('desired_items_json')
-    
-    if not file or file.filename == '':
-        return jsonify({"error": "No selected file"}), 400
-    
-    if not allowed_file(file.filename):
-        return jsonify({"error": "Invalid file type"}), 400
-    
-    if not desired_items_json:
-        return jsonify({"error": "No desired items provided"}), 400
+    if 'desired_items' not in request.form:
+        return jsonify({"error": "Missing 'desired_items' in request"}), 400
 
     try:
-        # Process image
-        image_bytes = file.read()
-        prescription_text = ocr_image(image_bytes)
-        
-        if not prescription_text.strip():
-            return jsonify({"error": "No text extracted from image"}), 400
+        desired_items = json.loads(request.form['desired_items'])
+        desired_names = [item["name"].lower() for item in desired_items]
 
-        # Process desired items
-        try:
-            desired_items = json.loads(desired_items_json)
-            if not isinstance(desired_items, list):
-                raise ValueError("Expected JSON array")
-        except Exception as e:
-            return jsonify({"error": f"Invalid JSON: {str(e)}"}), 400
+        # Check which medicines require a prescription
+        meds_requiring_prescription = [
+            name for name in desired_names if prescription_required_map.get(name, False)
+        ]
+        prescription_required = len(meds_requiring_prescription) > 0
 
-        # Format for LLM
-        desired_items_str = "\n".join(
-            f"- {item.get('name')}" + 
-            (f" (Quantity: {item['quantity']})" if item.get('quantity') else "")
-            for item in desired_items
-        )
+        # Validate uploaded files if prescription is required
+        files = request.files.getlist('files')
+        if prescription_required and not files:
+            return jsonify({
+                "error": "Prescription is required for one or more medications but not provided.",
+                "medicines_requiring_prescription": meds_requiring_prescription
+            }), 400
 
-        # LLM Processing
-        result = chain.invoke({
-            "prescription_text": prescription_text,
-            "desired_items_json": desired_items_str
-        })
-        
-        return jsonify(result.model_dump())
+        # Extract and combine OCR text
+        combined_text = ""
+        for file in files:
+            combined_text += " " + extract_text_from_file(file)
 
+        lower_text = combined_text.lower()
+
+        # Matching logic
+        matched_items = [name for name in desired_names if name in lower_text]
+        unmatched_items = [item for item in desired_items if item["name"].lower() not in matched_items]
+        prescribed_items = [{"medication_name": name.title()} for name in matched_items]
+
+        response = {
+            "ocr_text": combined_text.strip(),
+            "desired_items": desired_items,
+            "prescription_required": prescription_required,
+            "medicines_requiring_prescription": meds_requiring_prescription,
+            "verification_result": {
+                "is_valid_order": bool(matched_items),
+                "identified_prescribed_items": prescribed_items,
+                "verification_details": (
+                    "All medications found in prescription"
+                    if len(matched_items) == len(desired_names)
+                    else "Partial match found" if matched_items else "No matches found"
+                ),
+                "matched_items": [name.title() for name in matched_items],
+                "unmatched_desired_items": unmatched_items,
+                "additional_notes": (
+                    "All requested medications are valid"
+                    if not unmatched_items
+                    else "Some items missing"
+                )
+            },
+            "message": "Verification complete"
+        }
+
+        return jsonify(response)
+
+    except json.JSONDecodeError:
+        return jsonify({"error": "Invalid JSON format in 'desired_items'"}), 400
+    except ValueError as ve:
+        return jsonify({"error": str(ve)}), 400
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": f"Server error: {str(e)}"}), 500
 
-if __name__ == '__main__':
-    os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
-    app.run(host='0.0.0.0', port=5000, debug=True)
+if __name__ == "__main__":
+    app.run(debug=True, port=6000)
+
